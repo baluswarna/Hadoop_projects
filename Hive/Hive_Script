@@ -1,0 +1,202 @@
+#!/bin/bash
+#SBATCH --partition=debug
+#SBATCH --time=00:50:00
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --exclusive
+#SBATCH --job-name="WC_hive"
+#SBATCH --output=test-%J.out
+#SBATCH --mail-user=baluswar@buffalo.edu
+#Specifies that the job will be requeued after a node failure.
+#The default is that the job will not be requeued.
+#
+#This SLURM script is modified version of the SDSC script
+# found in /util/academic/myhadoop/myHadoop-0.30b/examples.
+# CDC January 29, 2015
+#
+echo "SLURM_JOBID="$SLURM_JOBID
+echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
+echo "SLURM_NNODES"=$SLURM_NNODES
+echo "SLURMTMPDIR="$SLURMTMPDIR
+
+echo "working directory = "$SLURM_SUBMIT_DIR
+set hive.map.aggr=true;
+module load java/1.6.0_22
+module load hadoop/2.5.1
+module load hive/0.14.0
+module load myhadoop/0.30b
+module list
+echo "MH_HOME="$MH_HOME
+echo "HADOOP_HOME="$HADOOP_HOME
+echo "Setting HADOOP to use SLURMTMPDIR on the local disk"
+export MH_SCRATCH_DIR=$SLURMTMPDIR
+echo "MH_SCRATCH_DIR="$MH_SCRATCH_DIR
+#### Set this to the directory where Hadoop configs should be generated
+# Don't change the name of this variable (HADOOP_CONF_DIR) as it is
+# required by Hadoop - all config files will be picked up from here
+#
+# Make sure that this is accessible to all nodes
+export HADOOP_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+export HIVE_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+echo "create diretory for HIVE metadata"
+### Set up the configuration
+# Make sure number of nodes is the same as what you have requested from PBS
+# usage: $myhadoop-configure.sh -h
+# this is the non-persistent mode
+NPROCS=`srun --nodes=${SLURM_NNODES} bash -c 'hostname' |wc -l`
+echo "-------Set up the configurations for myHadoop"
+$MH_HOME/bin/myhadoop-configure.sh 
+#
+cp $HIVE_HOME/conf/hive-env.sh-sample $HIVE_CONF_DIR/hive-env.sh
+cp $HIVE_HOME/conf/hive-default.xml-sample $HIVE_CONF_DIR/hive-default.xml
+sed -i 's:MY_HIVE_SCRATCH:'"$SLURMTMPDIR"':g' $HIVE_CONF_DIR/hive-default.xml
+cp $HIVE_HOME/conf/hive-log4j.properties-sample $HIVE_CONF_DIR/hive-log4j.properties
+sed -i 's:MY_HIVE_DIR:'"$SLURM_SUBMIT_DIR"':' $HIVE_CONF_DIR/hive-log4j.properties
+ls -l $HADOOP_CONF_DIR
+echo "-------Start hdfs and yarn ---"
+$HADOOP_HOME/sbin/start-all.sh
+#### Format HDFS, if this is the first time or not a persistent instance
+echo "-------Show Report ---"
+#$HADOOP_HOME/bin/hadoop dfsadmin -report
+echo "-------make directory ---"
+# DON'T CHANGE THSES COMMAND, AS YOU WILL NEED THESE DIRECTORY FOR CREATING TABLE
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir -p /user/hive/warehouse
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /user/hive/warehouse
+#echo "-------list warehouse directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -ls /user/hive/warehouse
+
+echo "Create database doc"
+$HIVE_HOME/bin/hive -e "
+DROP TABLE IF EXISTS readfile;
+DROP TABLE IF EXISTS appendfilename;
+DROP TABLE IF EXISTS monthend;
+DROP TABLE IF EXISTS monthendadj;
+DROP TABLE IF EXISTS monthbegin;
+DROP TABLE IF EXISTS monthbeginadj;
+DROP TABLE IF EXISTS ror;
+DROP TABLE IF EXISTS avgror;
+DROP TABLE IF EXISTS volatility;
+DROP TABLE IF EXISTS temporarytable;
+DROP TABLE IF EXISTS volatility_new;
+CREATE TABLE readfile
+(
+daterec string,
+open float,
+high float,
+low float,
+close float,
+volume float,
+adjClose float
+)row format delimited fields terminated by ',' LINES TERMINATED BY '\n';
+
+LOAD DATA LOCAL INPATH '$1' OVERWRITE INTO TABLE readfile;
+create table appendfilename
+(
+filename string,
+yearmonth string,
+day string,
+adjclose float
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE appendfilename SELECT regexp_replace(INPUT__FILE__NAME, '.*\//.*\/',''),SUBSTR(daterec,1,7),SUBSTR(daterec,9,10), adjClose FROM readfile;
+
+create table monthend
+(
+filename string,
+yearmonth string,
+monthend string
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE monthend SELECT filename,yearmonth,max(day) FROM appendfilename group by filename,yearmonth;
+
+create table monthendadj
+(
+filename string,
+yearmonth string,
+monthend string,
+adjclose float
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE monthendadj SELECT monthend.filename,monthend.yearmonth,monthend.monthend,appendfilename.adjclose FROM monthend join appendfilename on
+(monthend.filename=appendfilename.filename and monthend.yearmonth = appendfilename.yearmonth and monthend.monthend=appendfilename.day);
+
+create table monthbegin
+(
+filename string,
+yearmonth string,
+monthbegin string
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE monthbegin SELECT filename,yearmonth,min(day) FROM appendfilename group by filename,yearmonth;
+
+create table monthbeginadj
+(
+filename string,
+yearmonth string,
+monthbegin string,
+adjclose float
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE monthbeginadj SELECT monthbegin.filename,monthbegin.yearmonth,monthbegin.monthbegin,appendfilename.adjclose FROM monthbegin join appendfilename on (monthbegin.filename=appendfilename.filename and monthbegin.yearmonth = appendfilename.yearmonth and monthbegin.monthbegin=appendfilename.day);
+
+create table ror
+(
+filename string,
+yearmonth string,
+ror float
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE ror SELECT monthendadj.filename,monthendadj.yearmonth,(monthendadj.adjclose-monthbeginadj.adjclose)/(monthbeginadj.adjclose) as ror from monthendadj join monthbeginadj on (monthendadj.filename=monthbeginadj.filename and monthendadj.yearmonth=monthbeginadj.yearmonth);
+
+create table avgror
+(
+filename string,
+avgror float,
+countmonths int
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE avgror SELECT filename,avg(ror), count(ror) from ror group by filename;
+
+create table volatility
+(
+filename string,
+yearmonth string,
+volatility float
+)row format delimited fields terminated by ',';
+
+insert overwrite TABLE volatility SELECT ror.filename, ror.yearmonth, (ror.ror-avgror.avgror)*(ror.ror-avgror.avgror)/(avgror.countmonths-1) from ror join avgror on ror.filename = avgror.filename;
+
+create table temporarytable
+(
+filename string,
+volatility float
+) row format delimited fields terminated by ',';
+
+insert overwrite TABLE temporarytable SELECT filename, sqrt(sum(volatility)) from volatility group by filename;
+
+
+create table volatility_new
+(
+filename string,
+volatility float
+) row format delimited fields terminated by ',';
+
+insert overwrite TABLE volatility_new SELECT filename, volatility from temporarytable where volatility>0;
+
+select * from volatility_new order by volatility ASC limit 10;
+
+select * from volatility_new order by volatility DESC limit 10;
+
+
+
+" 
+##> $2/results.txt
+
+
+echo "-------Stop hdfs and yarn ---"
+$HADOOP_HOME/sbin/stop-all.sh
+
+#### Clean up the working directories after job completion
+$MH_HOME/bin/myhadoop-cleanup.sh
